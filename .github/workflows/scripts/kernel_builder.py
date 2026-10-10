@@ -431,7 +431,10 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         内核与管理器因此永远对不上。
 
         固定了 --ksu-commit 时改成数当前检出的 commit，版本号就与源码版本一致：
-            v4.2.0 (85eb4a95) -> 40000 + 3715 - 2815 = 40900  == 官方 v4.2.0 管理器 APK
+            v4.2.0 (85eb4a95) -> git rev-list --count HEAD = 3714
+                              -> 40000 + (3714 + 1) - 2815 = 40900  == 官方 v4.2.0 管理器 APK
+        那个 +1 是为了对齐 SukiSU 自己的编号：它用 GitHub API 数 main 的提交数，
+        而官方 APK 是在 tag 之后又落了一个提交时构建的，所以官方编号 = 该 commit 的 git 计数 + 1。
         """
         for name in ("Kbuild", "Makefile"):
             path = ksu_dir / "kernel" / name
@@ -442,7 +445,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 continue
             patched = content.replace("REPO_BRANCH := main", "REPO_BRANCH := HEAD")
             patched = re.sub(r"^LOCAL_COUNT[ \t]*:=.*$",
-                             "LOCAL_COUNT     := $(git_commit_count)",
+                             "LOCAL_COUNT     := $(shell expr $(git_commit_count) + 1)",
                              patched, count=1, flags=re.M)
             if patched != content:
                 path.write_text(patched)
