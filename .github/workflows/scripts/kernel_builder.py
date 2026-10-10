@@ -14,6 +14,166 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# 69_hide_stuff.patch 的确定性等价改写
+#
+# 上游补丁（ShirkNeko/SukiSU_patch/69_hide_stuff.patch，2025-03 后未更新）依赖
+# show_map_vma() 里这段上下文：
+#
+#     bypass_orig_flow:
+#     #endif
+#             pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+#
+# 新版 SUSFS 补丁已经删掉了 bypass_orig_flow 标签，于是：
+#   * patch -F 0：hunk#2（只加一个变量声明）照样应用，hunk#1/#3/#4 被拒
+#                 → 留下没人使用的 `struct dentry *dentry;`
+#   * patch -F 3：四个 hunk 全部“成功”，但 #3 锚点退化，代码被插进
+#                 `#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT` 分支内部，还把
+#                 `if (spoofed_redirected_name)` 的语句体顶掉
+# 内核开 -Werror，unused variable / unused label / unused function 全是致命错误，
+# 结果就是 18/19 个配置全部停在 fs/proc/task_mmu.o 编译失败。
+#
+# 这里改为按语义锚点精确插入：四个片段要么齐全，要么一个都不要。
+# ============================================================================
+HIDE_STUFF_HELPER = (
+    "static void show_vma_header_prefix_fake(struct seq_file *m,\n"
+    "\t\t\t\t\tunsigned long start, unsigned long end,\n"
+    "\t\t\t\t\tvm_flags_t flags, unsigned long long pgoff,\n"
+    "\t\t\t\t\tdev_t dev, unsigned long ino)\n"
+    "{\n"
+    "\tseq_setwidth(m, 25 + sizeof(void *) * 6 - 1);\n"
+    "\tseq_printf(m, \"%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu \",\n"
+    "\t\t\tstart,\n"
+    "\t\t\tend,\n"
+    "\t\t\tflags & VM_READ ? 'r' : '-',\n"
+    "\t\t\tflags & VM_WRITE ? 'w' : '-',\n"
+    "\t\t\tflags & VM_EXEC ? '-' : '-',\n"
+    "\t\t\tflags & VM_MAYSHARE ? 's' : 'p',\n"
+    "\t\t\tpgoff,\n"
+    "\t\t\tMAJOR(dev), MINOR(dev), ino);\n"
+    "}\n\n"
+)
+HIDE_STUFF_DECL = "\tstruct dentry *dentry;\n"
+HIDE_STUFF_BLOCK = (
+    "\t\tdentry = file->f_path.dentry;\n"
+    "\t\tif (dentry) {\n"
+    "\t\t\tconst char *path = (const char *)dentry->d_name.name;\n"
+    "\t\t\tif (strstr(path, \"lineage\")) {\n"
+    "\t\t\t\tstart = vma->vm_start;\n"
+    "\t\t\t\tend = vma->vm_end;\n"
+    "\t\t\t\tshow_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);\n"
+    "\t\t\t\tname = \"/system/framework/framework-res.apk\";\n"
+    "\t\t\t\tgoto done;\n"
+    "\t\t\t}\n"
+    "\t\t\tif (strstr(path, \"jit-zygote-cache\")) {\n"
+    "\t\t\t\tstart = vma->vm_start;\n"
+    "\t\t\t\tend = vma->vm_end;\n"
+    "\t\t\t\tshow_vma_header_prefix_fake(m, start, end, flags, pgoff, dev, ino);\n"
+    "\t\t\t\tgoto bypass;\n"
+    "\t\t\t}\n"
+    "\t\t}\n"
+)
+HIDE_STUFF_LABEL = "\tbypass:\n"
+# 锚点（均已在 android14-6.1 真实源码上验证全文唯一）
+HIDE_STUFF_ANCHOR_DECL = "\tconst char *name = NULL;\n"
+HIDE_STUFF_ANCHOR_BLOCK = "\t\tino = inode->i_ino;\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n"
+HIDE_STUFF_ANCHOR_LABEL = "\t/*\n\t * Print the dentry name for named mappings, and a\n"
+HIDE_STUFF_ANCHOR_HELPER = "static void\nshow_map_vma(struct seq_file *m, struct vm_area_struct *vma)\n"
+HIDE_STUFF_RE_DECL = re.compile(r"^[ \t]*struct dentry \*dentry[ \t]*(=[ \t]*NULL)?[ \t]*;[ \t]*$", re.M)
+HIDE_STUFF_RE_LABEL = re.compile(r"^[ \t]*bypass:[ \t]*$", re.M)
+HIDE_STUFF_RE_HELPER = re.compile(
+    r"^static void show_vma_header_prefix_fake\(.*?\n\}\n\n?", re.M | re.S)
+
+
+def _hide_stuff_strip_block(text: str) -> str:
+    """删掉 `dentry = file->f_path.dentry;` 起、到配对大括号为止的整段。"""
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, l in enumerate(lines) if "dentry = file->f_path.dentry" in l), None)
+    if start is None:
+        return text
+    j = start
+    while j < len(lines) and "if (dentry)" not in lines[j]:
+        j += 1
+    depth, end = 0, j
+    for k in range(j, len(lines)):
+        depth += lines[k].count("{") - lines[k].count("}")
+        if depth <= 0 and k >= j:
+            end = k
+            break
+    return "".join(lines[:start] + lines[end + 1:])
+
+
+def hide_stuff_strip(content: str) -> str:
+    """清掉 hide_stuff 的所有痕迹（含被插错位置的整段）。"""
+    content = _hide_stuff_strip_block(content)
+    content = HIDE_STUFF_RE_HELPER.sub("", content, count=1)
+    content = HIDE_STUFF_RE_DECL.sub("", content)
+    content = HIDE_STUFF_RE_LABEL.sub("", content)
+    return content
+
+
+def hide_stuff_problems(content: str) -> list:
+    """检查 hide_stuff 四个片段是否自洽，返回问题列表（空 = 正常）。"""
+    bad = []
+    if content.count("struct dentry *dentry") != 1:
+        bad.append(f"dentry 声明数={content.count('struct dentry *dentry')}(应为1)")
+    if content.count("dentry = file->f_path.dentry") != 1:
+        bad.append("dentry 赋值缺失或重复")
+    if len(HIDE_STUFF_RE_LABEL.findall(content)) != 1:
+        bad.append("bypass: 标签数不为 1")
+    if content.count("goto bypass;") != 1:
+        bad.append("goto bypass; 数不为 1")
+    if content.count("show_vma_header_prefix_fake") != 2:
+        bad.append("show_vma_header_prefix_fake 应为 1 定义 + 1 调用")
+    return bad
+
+
+def repair_hide_stuff(content: str) -> str:
+    """让 hide_stuff 的插入保持自洽：要么齐全，要么全部不要。"""
+    anchors = {
+        "decl": HIDE_STUFF_ANCHOR_DECL,
+        "block": HIDE_STUFF_ANCHOR_BLOCK,
+        "label": HIDE_STUFF_ANCHOR_LABEL,
+        "helper": HIDE_STUFF_ANCHOR_HELPER,
+    }
+
+    complete = (
+        "dentry = file->f_path.dentry" in content
+        and "goto bypass;" in content
+        and HIDE_STUFF_RE_LABEL.search(content) is not None
+        and "show_vma_header_prefix_fake" in content
+    )
+    if complete:
+        # 位置也要对：必须在主流程锚点之后（否则就是被 -F3 插进了 SUSFS 分支）
+        if HIDE_STUFF_ANCHOR_BLOCK in content and \
+                content.index("dentry = file->f_path.dentry") > content.index(HIDE_STUFF_ANCHOR_BLOCK):
+            logger.info("hide_stuff 已完整且位置正确，跳过")
+            return content
+        logger.warning("hide_stuff 位置不正确（被 patch -F3 插进了 SUSFS 分支），清理后重插")
+
+    leftover = any([
+        "dentry = file->f_path.dentry" in content,
+        HIDE_STUFF_RE_DECL.search(content) is not None,
+        HIDE_STUFF_RE_LABEL.search(content) is not None,
+        "show_vma_header_prefix_fake" in content,
+    ])
+    if leftover:
+        content = hide_stuff_strip(content)
+        logger.info("已清理 hide_stuff 的残缺代码（孤儿变量/标签/静态函数）")
+
+    missing = [name for name, anchor in anchors.items() if anchor not in content]
+    if missing:
+        logger.warning(f"hide_stuff 锚点缺失 {missing}，跳过该功能（保证能编译）")
+        return hide_stuff_strip(content)
+
+    content = content.replace(anchors["helper"], HIDE_STUFF_HELPER + anchors["helper"], 1)
+    content = content.replace(anchors["decl"], anchors["decl"] + HIDE_STUFF_DECL, 1)
+    content = content.replace(anchors["block"], anchors["block"] + HIDE_STUFF_BLOCK, 1)
+    content = content.replace(anchors["label"], HIDE_STUFF_LABEL + anchors["label"], 1)
+    logger.info("已按语义锚点精确插入 hide_stuff（helper/decl/block/label）")
+    return content
+
+
 @dataclass
 class BuildResult:
     success: bool
@@ -301,12 +461,54 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}", check=False)
                 self._chdir(self.work_dir)
 
+        # ===== KernelSU 侧 SUSFS 补丁（原来漏掉了，导致 SUSFS 根本没编进内核）=====
+        # susfs4ksu 的 50_ 补丁里所有代码都被 `#ifdef CONFIG_KSU_SUSFS*` 包着，
+        # 而这些 Kconfig 符号是由 kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+        # 加到 KernelSU 的 kernel/Kconfig 里的。不应用它，gki_defconfig 里追加的
+        # CONFIG_KSU_SUSFS* 会作为未知符号被 Kconfig 静默丢弃，
+        # 构建日志里连 fs/susfs.o 都不会出现（SUSFS 功能等于没编）。
+        ksu_susfs_patch = self.susfs_dir / "kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+        ksu_dir = self.work_dir / "KernelSU"
+        if ksu_susfs_patch.exists() and ksu_dir.exists():
+            logger.info("=== 应用 KernelSU 侧 SUSFS 补丁 ===")
+            self._chdir(ksu_dir)
+            # 先 dry-run：这个补丁跟踪的是 KernelSU 官方仓库，SukiSU 的 kernel/ 结构
+            # 不一定对得上。宁可明确报错，也不要打进去一堆 .rej 造成半吊子状态。
+            dry = self._run_cmd(f"patch -p1 --fuzz=3 --dry-run < {ksu_susfs_patch}",
+                                check=False, capture_output=True)
+            dry_out = f"{dry.stdout or ''}{dry.stderr or ''}"
+            if dry.returncode == 0 and "FAILED" not in dry_out:
+                self._run_cmd(f"patch -p1 --fuzz=3 < {ksu_susfs_patch}", check=False)
+                ksu_kconfig = ksu_dir / "kernel/Kconfig"
+                if ksu_kconfig.exists() and "config KSU_SUSFS" in ksu_kconfig.read_text(errors="ignore"):
+                    logger.info("CONFIG_KSU_SUSFS 符号已定义，SUSFS 会被编译进内核")
+                else:
+                    logger.error("补丁应用了但 KernelSU Kconfig 里没有 config KSU_SUSFS，SUSFS 仍不会编译")
+            else:
+                failed = [l for l in dry_out.splitlines() if "FAILED" in l or "hunks" in l]
+                logger.error("KernelSU 侧 SUSFS 补丁无法干净应用 —— 本次构建不会包含 SUSFS！"
+                             "（SukiSU 版本与补丁不匹配，请用 --ksu-commit 指定匹配版本）")
+                for line in failed[:10]:
+                    logger.error(f"    {line.strip()}")
+            self._chdir(self.work_dir)
+        else:
+            logger.error(f"缺少 KernelSU 侧 SUSFS 补丁，SUSFS 不会被编译"
+                         f"（patch={ksu_susfs_patch.exists()}, KernelSU 目录={ksu_dir.exists()}）")
+
     def apply_sukisu_patches(self):
-        logger.info("=== 应用 SukiSU 补丁 ===")
+        """69_hide_stuff.patch：只保留还能干净应用的部分（fs/proc/base.c）。
+
+        task_mmu.c 那几个 hunk 依赖的上下文已被新版 SUSFS 补丁改掉：
+        用 -F 3 会“成功”但把代码插进 `#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT` 分支内部，
+        只留下没人用的 `struct dentry *dentry`（以及没人跳的 `bypass:` 标签），
+        内核 -Werror 直接编挂。所以这里改成 -F 0 不模糊匹配，只吃干净的部分；
+        task_mmu.c 的真正插入由 apply_task_mmu_fixes() 里的 repair_hide_stuff() 精确完成。
+        """
+        logger.info("=== 应用 SukiSU 补丁 (69_hide_stuff) ===")
         self._chdir(self.work_dir / "common")
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
-            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=False)
+            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 0 < 69_hide_stuff.patch", check=False)
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -358,10 +560,18 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 content = '\n'.join(new_lines)
                 logger.info("已添加 VMA_PAD_START 宏定义")
 
-        # ===== 修复 dentry 未初始化（如果还存在） =====
-        if "struct dentry *dentry;" in content:
-            content = content.replace("struct dentry *dentry;", "struct dentry *dentry = NULL;")
-            logger.info("已修复 dentry 未初始化问题")
+        # ===== 69_hide_stuff：按语义锚点精确插入 / 清理残缺代码 =====
+        # （原来这里只是把 `struct dentry *dentry;` 改成 `= NULL`，治标不治本：
+        #   变量依旧没人用，-Werror 照样失败）
+        before = content
+        content = repair_hide_stuff(content)
+        problems = hide_stuff_problems(content)
+        if problems:
+            logger.warning(f"hide_stuff 自检仍有问题: {problems}")
+            content = hide_stuff_strip(content)
+            logger.warning("已回退为“完全不打该补丁”的干净状态")
+        elif content != before:
+            logger.info("task_mmu.c hide_stuff 处理完成")
 
         # ===== 写入修改 =====
         with open(task_mmu, "w") as f:
