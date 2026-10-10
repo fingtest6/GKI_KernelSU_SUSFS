@@ -417,6 +417,37 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 self._chdir(ksu_dir)
                 self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)
                 self._chdir(self.work_dir)
+                self._pin_ksu_version_to_commit(ksu_dir)
+
+    def _pin_ksu_version_to_commit(self, ksu_dir: Path):
+        """让内核上报的 versionCode 反映「实际检出的 commit」，而不是 main 分支的实时提交数。
+
+        KernelSU 的 kernel/Kbuild 里：
+            KSU_VERSION := 40000 + LOCAL_COUNT - 2815
+        而 LOCAL_COUNT 默认是构建时用 GitHub API 查 **main 分支当前提交数**：
+            GITHUB_COMMITS := curl .../commits?sha=main&per_page=1 | 取 Link 的 page=last
+            LOCAL_COUNT    := $(if $(GITHUB_COMMITS),$(GITHUB_COMMITS),$(git_commit_count))
+        结果是任何一次构建都会报「最新」的版本号 —— 从 v4.2.0 源码编出来的内核也会报 40971，
+        内核与管理器因此永远对不上。
+
+        固定了 --ksu-commit 时改成数当前检出的 commit，版本号就与源码版本一致：
+            v4.2.0 (85eb4a95) -> 40000 + 3715 - 2815 = 40900  == 官方 v4.2.0 管理器 APK
+        """
+        for name in ("Kbuild", "Makefile"):
+            path = ksu_dir / "kernel" / name
+            if not path.exists():
+                continue
+            content = path.read_text(errors="ignore")
+            if "KSU_VERSION" not in content or "LOCAL_COUNT" not in content:
+                continue
+            patched = content.replace("REPO_BRANCH := main", "REPO_BRANCH := HEAD")
+            patched = re.sub(r"^LOCAL_COUNT[ \t]*:=.*$",
+                             "LOCAL_COUNT     := $(git_commit_count)",
+                             patched, count=1, flags=re.M)
+            if patched != content:
+                path.write_text(patched)
+                logger.info(f"KSU 版本号改为跟随检出的 commit（{name}），不再用 main 的实时提交数")
+            return
 
     def add_bbg(self):
         if not self.config.use_bbg:
